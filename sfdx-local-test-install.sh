@@ -428,11 +428,35 @@ if want_step 6; then
 
   OUT_DIR="$WORKDIR/_vsix"; mkdir -p "$OUT_DIR"
 
+  # We only need to rebuild the extensions that actually consume
+  # @salesforce/templates — everything else can stay at its registry-
+  # published version. This cuts step 6 from ~5 minutes to ~1.5 minutes.
+  #
+  # CONSUMER_DIRS was populated in step 5. If step 6 was run standalone,
+  # rediscover.
+  if [[ ${#CONSUMER_DIRS[@]} -eq 0 ]]; then
+    while IFS= read -r pj; do CONSUMER_DIRS+=("$(dirname "$pj")"); done \
+      < <(find_consumers_of "$VSCODE_DIR" "@salesforce/templates")
+  fi
+  CONSUMER_NAMES=()
+  for c in "${CONSUMER_DIRS[@]}"; do
+    CONSUMER_NAMES+=("$(basename "$c")")
+  done
+  if [[ ${#CONSUMER_NAMES[@]} -eq 0 ]]; then
+    warn "No vscode packages consume @salesforce/templates — skipping step 6"
+    return 0 2>/dev/null || true
+  fi
+  log "Building only @salesforce/templates consumers: ${CONSUMER_NAMES[*]}"
+
   # The repo provides root scripts that wireit-orchestrate bundle + package
   # per extension. Use them — running vsce per-package fails because the
   # bundler step is owned by `vscode:bundle`, not `build`/`compile`.
-  log "Running root vscode:bundle (esbuild per extension — picks up linked templates)"
-  ( cd "$VSCODE_DIR" && npm run vscode:bundle )
+  # Use wireit's per-target invocation to limit work to the consumers.
+  log "Running vscode:bundle for consumers only (esbuild)"
+  for n in "${CONSUMER_NAMES[@]}"; do
+    info "bundle: $n"
+    ( cd "$VSCODE_DIR/packages/$n" && npm run vscode:bundle )
+  done
 
   # Remove the per-package @salesforce/templates symlinks before vscode:package,
   # otherwise vsce's `npm list --production` rejects them as extraneous. The
@@ -558,8 +582,11 @@ PY
     /bin/rm -rf "$nm"
   done < <(find "$VSCODE_DIR/packages" -path '*/dist/templates/*node_modules' -type d -prune -print0 2>/dev/null)
 
-  log "Running root vscode:package (vsce per extension)"
-  ( cd "$VSCODE_DIR" && npm run vscode:package )
+  log "Running vscode:package for consumers only (vsce)"
+  for n in "${CONSUMER_NAMES[@]}"; do
+    info "package: $n"
+    ( cd "$VSCODE_DIR/packages/$n" && npm run vscode:package ) || warn "vscode:package failed for $n"
+  done
 
   # Collect produced VSIX files.
   packaged=0
