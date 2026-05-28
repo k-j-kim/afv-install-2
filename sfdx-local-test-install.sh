@@ -87,20 +87,73 @@ is_internal_owner() {
   return 1
 }
 
+# All gh accounts logged in (regardless of which is active).
+gh_logged_in_accounts() {
+  gh auth status 2>&1 | awk '/Logged in to github.com account/ { for(i=1;i<=NF;i++) if($i=="account") print $(i+1) }'
+}
+
+gh_active_account() {
+  gh auth status 2>&1 | awk '
+    /Logged in to github.com account/ { last=$NF; for(i=1;i<=NF;i++) if($i=="account") last=$(i+1) }
+    /Active account: true/ { print last; exit }
+  '
+}
+
+# Pick the right gh account for a repo owner. Strategy:
+#  1. If active account already has access (gh api repos/<owner>/... 200) → keep it.
+#  2. Otherwise iterate over all logged-in accounts, switch to each, retest.
+#  3. Cache the choice per owner so we don't probe repeatedly.
+declare _GH_OWNER_CACHE_KEYS=""
+_gh_owner_cache_get() {
+  local owner="$1"
+  echo "$_GH_OWNER_CACHE_KEYS" | awk -F= -v k="$owner" '$1==k{print $2; found=1} END{exit !found}'
+}
+_gh_owner_cache_set() {
+  _GH_OWNER_CACHE_KEYS="$_GH_OWNER_CACHE_KEYS
+$1=$2"
+}
+
+_gh_account_can_access() {
+  local owner="$1"
+  # Probe with a cheap, cacheable endpoint that works for both public + private orgs.
+  gh api "users/$owner" --silent >/dev/null 2>&1 \
+    && gh api "orgs/$owner/repos?per_page=1" --silent >/dev/null 2>&1 \
+    || gh api "users/$owner/repos?per_page=1" --silent >/dev/null 2>&1
+}
+
 ensure_gh_account_for() {
-  local owner="$1" target=""
-  if is_internal_owner "$owner"; then target="$GH_ACCOUNT_INTERNAL"
-  else target="$GH_ACCOUNT_PUBLIC"; fi
-  local active
-  active="$(gh auth status 2>&1 | awk '/Active account: true/{f=1; next} f && /Logged in to/{print $NF; exit}')" || true
-  # Fallback parse
-  if [[ -z "$active" ]]; then
-    active="$(gh auth status 2>&1 | grep -B1 'Active account: true' | grep 'account ' | awk '{print $NF}' | head -1)"
+  local owner="$1"
+  local cached
+  if cached="$(_gh_owner_cache_get "$owner")" 2>/dev/null && [[ -n "$cached" ]]; then
+    local active="$(gh_active_account)"
+    [[ "$active" != "$cached" ]] && gh auth switch --user "$cached" >/dev/null
+    return 0
   fi
-  if [[ "$active" != "$target" ]]; then
-    log "Switching gh account → $target (for $owner)"
-    gh auth switch --user "$target" >/dev/null
+
+  local active="$(gh_active_account)"
+  # Try the active account first
+  if _gh_account_can_access "$owner"; then
+    info "gh: using active account ($active) for $owner"
+    _gh_owner_cache_set "$owner" "$active"
+    return 0
   fi
+
+  # Probe all logged-in accounts
+  local acc
+  while IFS= read -r acc; do
+    [[ -z "$acc" || "$acc" == "$active" ]] && continue
+    log "Trying gh account '$acc' for $owner"
+    gh auth switch --user "$acc" >/dev/null
+    if _gh_account_can_access "$owner"; then
+      info "gh: using $acc for $owner"
+      _gh_owner_cache_set "$owner" "$acc"
+      return 0
+    fi
+  done < <(gh_logged_in_accounts)
+
+  warn "No logged-in gh account has access to $owner — clones may 404."
+  warn "Run: gh auth login   (and add the account that has access to $owner)"
+  return 1
 }
 
 parse_repo()   { echo "${1%%@*}"; }
@@ -121,7 +174,28 @@ clone_into_workdir() {
     log "Cloning $repo@$branch"
     gh repo clone "$repo" "$dest" -- --depth 1 --branch "$branch" >/dev/null
   fi
+  # Drop a public-registry .npmrc so users with internal nexus configs in their
+  # global ~/.npmrc don't get rerouted (or fail auth) when this script runs
+  # `npm install` / `yarn install` inside the cloned repo.
+  write_public_npmrc "$dest"
   echo "$dest"
+}
+
+# Force every cloned repo to resolve npm packages from the public registry,
+# bypassing whatever the user has in ~/.npmrc (e.g. nexus-proxy URLs that
+# may need internal auth or rewrite scoped packages).
+write_public_npmrc() {
+  local dir="$1"
+  cat > "$dir/.npmrc" <<'EOF'
+# Auto-written by sfdx-local-test-install.sh. Forces public npm registry,
+# overriding the user's global ~/.npmrc (which may point at an internal
+# nexus proxy that requires auth or rewrites scoped packages).
+registry=https://registry.npmjs.org/
+@salesforce:registry=https://registry.npmjs.org/
+@oclif:registry=https://registry.npmjs.org/
+@lwc:registry=https://registry.npmjs.org/
+always-auth=false
+EOF
 }
 
 # Install + build helper — chooses npm or yarn based on lockfile.
@@ -173,6 +247,11 @@ find_consumers_of() {
 # ── Step 1: install the local AFV vsix ────────────────────────────────────────
 if want_step 1; then
   step "Step 1: install local AFV vsix"
+  # Resolve LOCAL_VSIX relative to the script dir (the bundled vsix/ ships
+  # next to this script). An absolute path in repos.conf takes precedence.
+  if [[ "$LOCAL_VSIX" != /* ]]; then
+    LOCAL_VSIX="$SCRIPT_DIR/$LOCAL_VSIX"
+  fi
   if [[ -f "$LOCAL_VSIX" ]]; then
     code --install-extension "$LOCAL_VSIX" --force
     info "Installed: $LOCAL_VSIX"
@@ -256,6 +335,21 @@ if want_step 2; then
     # src/templates/project/) consumes our linked sources.
     log "Building salesforcedx-templates so it picks up linked sources"
     ( cd "$TEMPLATES_DIR" && yarn build )
+
+    # The build can leave nested node_modules trees under
+    # lib/templates/project/<name>/_p_/_m_/_w_/_a_/node_modules — these
+    # come from the webapps dist/ tree being copied verbatim and from
+    # `npm install --package-lock-only` partially materializing on newer
+    # npm. They blow up `vsce package` later (vsce trips on .bin scripts).
+    # Strip any node_modules under the built templates tree.
+    log "Stripping stray node_modules from built templates"
+    stray_count=0
+    while IFS= read -r -d '' nm; do
+      /bin/rm -rf "$nm"
+      stray_count=$((stray_count+1))
+    done < <(find "$TEMPLATES_DIR/lib/templates" "$TEMPLATES_DIR/src/templates" \
+              -type d -name node_modules -prune -print0 2>/dev/null)
+    info "Removed $stray_count stray node_modules tree(s)"
   fi
   # Make salesforcedx-templates itself linkable
   ( cd "$TEMPLATES_DIR" && npm link >/dev/null )
@@ -349,6 +443,120 @@ if want_step 6; then
       [[ -L "$l" ]] && /bin/rm -f "$l" && info "unlinked ${l#$VSCODE_DIR/}"
     done
   fi
+
+  # Esbuild copies the templates dir verbatim into each consumer's dist/
+  # (so the runtime can read template files at extension load). The bundled
+  # templates contain inner package.json files (the user-facing scaffolds
+  # for `npm ci` after generation). When `vsce package` runs `npm install`
+  # in its temp build dir, npm 11 walks into those inner package.json files
+  # and creates a node_modules tree with .bin symlinks — which then dangle
+  # and trip vsce with `EEXIST`/`currentLevel undefined`.
+  #
+  # Workaround: before vsce, hide the inner package.json + package-lock.json
+  # files so npm's recursion can't see them. Restore after.
+  # vsce's bundled-extension.ts runs `npm install` in a /tmp staging dir
+  # that contains nested package.json files (the user-facing template
+  # scaffolds). npm 11 walks into those nested files and creates broken
+  # `.bin` symlinks that vsce then chokes on. Patch the script to skip
+  # those nested package.json files via `--workspaces=false`, plus pass
+  # `NPM_CONFIG_PACKAGE_LOCK_ONLY=true` to avoid materializing any tree.
+  log "Patching vsce-bundled-extension.ts to neutralize nested npm walk"
+  BUNDLED_TS="$VSCODE_DIR/scripts/vsce-bundled-extension.ts"
+  if [[ -f "$BUNDLED_TS" && ! -f "$BUNDLED_TS.afv-orig" ]]; then
+    cp "$BUNDLED_TS" "$BUNDLED_TS.afv-orig"
+  fi
+  if [[ -f "$BUNDLED_TS" ]]; then
+    # Insert renames of nested package.json files BEFORE npm install,
+    # restore AFTER vsce package. Idempotent — won't double-patch.
+    if ! grep -q 'AFV_RENAME_NESTED' "$BUNDLED_TS"; then
+      python3 - "$BUNDLED_TS" <<'PY'
+import sys, re, pathlib
+p = pathlib.Path(sys.argv[1])
+src = p.read_text()
+hide_block = """
+// AFV_RENAME_NESTED: hide nested package.json/package-lock.json under dist/templates
+// so the upcoming `npm install` (in this temp build dir) doesn't walk into them
+// and create dangling .bin symlinks that break vsce.
+import { renameSync as _afvRenameSync } from 'fs';
+function _afvWalkRename(dir: string, suffix: string): string[] {
+  const out: string[] = [];
+  const entries = readdirSync(dir, { withFileTypes: true });
+  for (const e of entries) {
+    const full = `${dir}/${e.name}`;
+    if (e.isDirectory()) {
+      out.push(..._afvWalkRename(full, suffix));
+    } else if ((e.name === 'package.json' || e.name === 'package-lock.json')
+               && (full.includes('/dist/templates/') || full.includes('/extension/dist/templates/'))) {
+      _afvRenameSync(full, full + suffix);
+      out.push(full);
+    }
+  }
+  return out;
+}
+const _afvHidden: string[] = [];
+try {
+  if (existsSync(`${cwd}/dist/templates`)) _afvHidden.push(..._afvWalkRename(`${cwd}/dist/templates`, '.afv-hidden'));
+} catch (e) { logger('AFV hide failed: ' + (e as Error).message); }
+logger(`AFV: hidden ${_afvHidden.length} nested package.json files`);
+"""
+restore_block = """
+// AFV_RENAME_NESTED: restore the hidden files INTO the produced .vsix.
+// vsce just packaged the tree without them; we patch the .vsix here so
+// end users get a complete template scaffold.
+for (const f of _afvHidden) {
+  try { _afvRenameSync(f + '.afv-hidden', f); } catch {}
+}
+// Add restored files back into the .vsix using the system `zip` tool.
+const _afvVsix = readdirSync(cwd).find((f) => f.endsWith('.vsix'));
+if (_afvVsix && _afvHidden.length > 0) {
+  const _path = require('path');
+  const _afvVsixAbs = `${cwd}/${_afvVsix}`;
+  for (const f of _afvHidden) {
+    // f is like /tmp/.../extension/dist/templates/.../package.json — add as extension/dist/...
+    const idx = f.indexOf('/extension/');
+    if (idx === -1) continue;
+    const inZip = f.slice(idx + 1);  // strip leading slash via +1
+    const stage = require('os').tmpdir() + '/afv-stage-' + Date.now() + Math.random();
+    require('fs').mkdirSync(`${stage}/${_path.dirname(inZip)}`, { recursive: true });
+    require('fs').copyFileSync(f, `${stage}/${inZip}`);
+    try { execSync(`zip -qr "${_afvVsixAbs}" .`, { cwd: stage, stdio: 'pipe' }); } catch {}
+    try { require('fs').rmSync(stage, { recursive: true, force: true }); } catch {}
+  }
+  logger(`AFV: re-added ${_afvHidden.length} files to ${_afvVsix}`);
+}
+"""
+
+# Insert hide block right BEFORE the npm install line
+src2 = re.sub(
+    r"(\nlogger\('executing npm install'\);)",
+    hide_block + r"\1",
+    src,
+    count=1,
+)
+if src2 == src:
+    print("WARN: hide insertion point not found", file=sys.stderr)
+
+# Insert restore block right AFTER 'copy vsix back to extension directory' logger
+src3 = re.sub(
+    r"(logger\('copy vsix back to extension directory'\);)",
+    restore_block + r"\1",
+    src2,
+    count=1,
+)
+if src3 == src2:
+    print("WARN: restore insertion point not found", file=sys.stderr)
+
+p.write_text(src3)
+print("AFV patch applied")
+PY
+    fi
+  fi
+
+  # Strip any node_modules already present in dist/templates (from prior runs)
+  # so cpSync into the temp build dir doesn't carry dangling .bin symlinks.
+  while IFS= read -r -d '' nm; do
+    /bin/rm -rf "$nm"
+  done < <(find "$VSCODE_DIR/packages" -path '*/dist/templates/*node_modules' -type d -prune -print0 2>/dev/null)
 
   log "Running root vscode:package (vsce per extension)"
   ( cd "$VSCODE_DIR" && npm run vscode:package )
