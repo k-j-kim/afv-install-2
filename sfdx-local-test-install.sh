@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # sfdx-local-test-install.sh
 #
-# Stand up a local sf CLI + VS Code environment that consumes in-progress changes
-# across the webapps → salesforcedx-templates → plugin-templates / salesforcedx-vscode
-# chain via npm link, then installs Einstein-GPT (AFV) plus skills from a PR.
+# Stand up a local sf CLI + VS Code environment with up-to-date AFV
+# (Einstein-GPT) extensions, an SF CLI templates plugin patched to pull
+# the latest ui-bundle template packages from npm, and the latest skills
+# from sf-skills-internal.
 #
 # All clones happen under a single temp working directory so the host filesystem
 # stays clean. Pass --keep to preserve the workdir for inspection.
@@ -13,14 +14,27 @@
 #   bash sfdx-local-test-install.sh --only 1,7
 #
 # Steps:
-#   1  install local AFV vsix (from LOCAL_VSIX in repos.conf)
-#   2  webapps          → salesforcedx-templates    (npm link)
-#   3  salesforcedx-templates → plugin-templates    (npm link)
+#   1  install bundled VSIX files (AFV + salesforcedx-vscode-core + -services)
+#   2  bump @salesforce/ui-bundle-template-* devDeps to latest + rebuild
+#       salesforcedx-templates so its lib/templates/ has fresh content
+#   3  symlink local salesforcedx-templates into plugin-templates + compile
 #   4  link plugin-templates into local sf CLI
-#   5  salesforcedx-templates → salesforcedx-vscode (npm link, only packages that consume it)
-#   6  build vsix from salesforcedx-vscode and install into VS Code
-#   7  install AFV skills from sf-skills-internal PR #${SKILLS_PR_NUMBER} into Skills-Salesforce/
-#   8  override the AFV sample-app source via git url.insteadOf with PR #${SAMPLE_APPS_PR_NUMBER}
+#   5  install AFV skills from sf-skills-internal PR #${SKILLS_PR_NUMBER}
+#   6  override the AFV sample-app source via git url.insteadOf with PR #${SAMPLE_APPS_PR_NUMBER}
+#
+# Why steps 2-4 exist:
+#   The published @salesforce/plugin-templates pins @salesforce/templates,
+#   which in turn pins very stale (1.x) versions of the ui-bundle-template-*
+#   packages. The new content (customApplication metadata, etc.) only ships
+#   in 9.x on npm. We rebuild the chain locally with the bump applied so
+#   `sf template generate project --template reactinternalapp` emits the
+#   new files.
+#
+# The VS Code extensions are NOT rebuilt at install time — the repo ships
+# pre-built VSIX files (vsix/salesforcedx-vscode-core-*.vsix, vsix/
+# salesforcedx-vscode-services-*.vsix) that already have the linked
+# templates inlined via esbuild. To refresh them, see
+# scripts/rebuild-vscode-vsix.sh.
 
 set -euo pipefail
 
@@ -230,129 +244,76 @@ pkg_field() {
   fi
 }
 
-# Find every package.json under a path that declares a dep on a given pkg name
-# (in dependencies, devDependencies, or peerDependencies). Prints paths.
-find_consumers_of() {
-  local root="$1" pkg_name="$2"
-  # Skip node_modules
-  while IFS= read -r -d '' pj; do
-    node -e "
-      const p=require('$pj');
-      const all={...(p.dependencies||{}),...(p.devDependencies||{}),...(p.peerDependencies||{})};
-      if (all['$pkg_name']) console.log('$pj');
-    " 2>/dev/null
-  done < <(find "$root" -name package.json -not -path '*/node_modules/*' -print0)
-}
-
-# ── Step 1: install the local AFV vsix ────────────────────────────────────────
+# ── Step 1: install bundled VSIX files ────────────────────────────────────────
 if want_step 1; then
-  step "Step 1: install local AFV vsix"
-  # Resolve LOCAL_VSIX relative to the script dir (the bundled vsix/ ships
-  # next to this script). An absolute path in repos.conf takes precedence.
-  if [[ "$LOCAL_VSIX" != /* ]]; then
-    LOCAL_VSIX="$SCRIPT_DIR/$LOCAL_VSIX"
-  fi
-  if [[ -f "$LOCAL_VSIX" ]]; then
-    code --install-extension "$LOCAL_VSIX" --force
-    info "Installed: $LOCAL_VSIX"
+  step "Step 1: install bundled VSIX files"
+  # Install every .vsix in the repo's vsix/ directory. Ships:
+  #   - salesforcedx-einstein-gpt-*.vsix     (AFV / Einstein-GPT)
+  #   - salesforcedx-vscode-core-*.vsix      (with linked templates inlined)
+  #   - salesforcedx-vscode-services-*.vsix  (with linked templates inlined)
+  vsix_dir="$SCRIPT_DIR/vsix"
+  if [[ ! -d "$vsix_dir" ]]; then
+    warn "vsix/ directory not found at $vsix_dir — skipping VSIX installs"
   else
-    warn "LOCAL_VSIX not found: $LOCAL_VSIX — skipping"
+    installed=0
+    for v in "$vsix_dir"/*.vsix; do
+      [[ -f "$v" ]] || continue
+      log "Installing $(basename "$v")"
+      code --install-extension "$v" --force >/dev/null && installed=$((installed+1)) \
+        || warn "Failed to install $(basename "$v")"
+    done
+    log "Installed $installed VSIX file(s)"
   fi
 fi
 
-# ── Step 2: webapps → salesforcedx-templates (npm link) ───────────────────────
-# webapps is an nx/lerna monorepo. salesforcedx-templates devDepends on
-# @salesforce/ui-bundle-template-* packages that live inside webapps. We link
-# every webapps package whose name appears in salesforcedx-templates'
-# package.json deps/devDeps.
-WEBAPPS_DIR=""; TEMPLATES_DIR=""
+# ── Step 2: bump @salesforce/ui-bundle-template-* to latest + build ──────────
+# salesforcedx-templates devDepends on @salesforce/ui-bundle-template-*
+# packages but pins them to ^1.135.0 — many major versions behind. The
+# customApplication metadata and the rest of the new template content
+# all ship in 9.x on the public npm registry. We just bump the deps to
+# `latest` and rebuild — no webapps clone, no symlink chain.
+TEMPLATES_DIR=""
 if want_step 2; then
-  step "Step 2: webapps → salesforcedx-templates (npm link)"
-  WEBAPPS_DIR="$(clone_into_workdir "$WEBAPPS_REPO")"
+  step "Step 2: bump ui-bundle-template-* deps to latest + build"
   TEMPLATES_DIR="$(clone_into_workdir "$TEMPLATES_REPO")"
-  install_and_build "$WEBAPPS_DIR"
 
-  # Build a parallel-array map: WEBAPPS_NAMES[i] → WEBAPPS_DIRS[i]
-  WEBAPPS_NAMES=(); WEBAPPS_DIRS=()
-  while IFS= read -r -d '' pj; do
-    name="$(pkg_field "$pj" name)"
-    [[ -z "$name" ]] && continue
-    private="$(pkg_field "$pj" private || true)"
-    [[ "$private" == "true" ]] && continue
-    WEBAPPS_NAMES+=("$name")
-    WEBAPPS_DIRS+=("$(dirname "$pj")")
-  done < <(find "$WEBAPPS_DIR/packages" -mindepth 2 -maxdepth 6 -name package.json -not -path '*/node_modules/*' -print0)
+  # Find every @salesforce/ui-bundle-template-* devDep and rewrite its
+  # version to "latest" (resolved by yarn at install time).
+  log "Rewriting @salesforce/ui-bundle-template-* devDeps → latest"
+  node -e "
+    const fs = require('fs');
+    const path = '$TEMPLATES_DIR/package.json';
+    const p = JSON.parse(fs.readFileSync(path, 'utf8'));
+    const dd = p.devDependencies || {};
+    let bumped = 0;
+    for (const k of Object.keys(dd)) {
+      if (k.startsWith('@salesforce/ui-bundle-template-')) {
+        dd[k] = 'latest';
+        bumped++;
+      }
+    }
+    p.devDependencies = dd;
+    fs.writeFileSync(path, JSON.stringify(p, null, 2) + '\n');
+    console.error('   · bumped ' + bumped + ' template devDeps to latest');
+  "
 
-  # Lookup helper
-  webapps_dir_for() {
-    local q="$1" i
-    for i in "${!WEBAPPS_NAMES[@]}"; do
-      [[ "${WEBAPPS_NAMES[$i]}" == "$q" ]] && { echo "${WEBAPPS_DIRS[$i]}"; return 0; }
-    done
-    return 1
-  }
+  log "yarn install (ignore-scripts) in salesforcedx-templates"
+  # The lockfile pins the old 1.x — drop --frozen-lockfile so yarn re-resolves.
+  ( cd "$TEMPLATES_DIR" && yarn install --ignore-scripts )
 
-  # Determine which of these names salesforcedx-templates consumes
-  CONSUMED_NAMES=()
-  while IFS= read -r name; do
-    if webapps_dir_for "$name" >/dev/null; then CONSUMED_NAMES+=("$name"); fi
-  done < <(node -e "
-    const p=require('$TEMPLATES_DIR/package.json');
-    const all={...(p.dependencies||{}),...(p.devDependencies||{})};
-    Object.keys(all).forEach(k=>console.log(k));
-  ")
+  log "yarn build (compiles + scripts/copy-templates pulls in fresh template files)"
+  ( cd "$TEMPLATES_DIR" && yarn build )
 
-  if [[ ${#CONSUMED_NAMES[@]} -eq 0 ]]; then
-    warn "No webapps packages are consumed by salesforcedx-templates — nothing to link"
-  else
-    log "Linking ${#CONSUMED_NAMES[@]} webapps package(s) into salesforcedx-templates:"
-    for n in "${CONSUMED_NAMES[@]}"; do info "$n  ($(webapps_dir_for "$n"))"; done
-
-    # salesforcedx-templates uses yarn with a frozen lockfile pinning these
-    # packages to a stale registry version (1.x). yarn won't honor `npm link`
-    # in node_modules, so we:
-    #   1. yarn install --no-frozen-lockfile (don't fail on lockfile drift)
-    #   2. swap each consumed dep's node_modules dir for a symlink to the
-    #      local webapps source dir
-    #   3. RE-RUN the build — its postinstall/prepare step copies these into
-    #      src/templates/project/<name>/, baking the local code into the
-    #      packaged @salesforce/templates that downstream consumers will use.
-    log "yarn install --ignore-scripts in salesforcedx-templates"
-    ( cd "$TEMPLATES_DIR" && yarn install --ignore-scripts )
-
-    NM="$TEMPLATES_DIR/node_modules"
-    for n in "${CONSUMED_NAMES[@]}"; do
-      target_dir="$NM/$n"
-      src_dir="$(webapps_dir_for "$n")"
-      [[ -d "$src_dir" ]] || { warn "missing webapps src for $n"; continue; }
-      /bin/rm -rf "$target_dir"
-      mkdir -p "$(dirname "$target_dir")"
-      ln -s "$src_dir" "$target_dir"
-      info "Symlinked $n → $src_dir"
-    done
-
-    # Run the templates build so the copy step (Copied @salesforce/... →
-    # src/templates/project/) consumes our linked sources.
-    log "Building salesforcedx-templates so it picks up linked sources"
-    ( cd "$TEMPLATES_DIR" && yarn build )
-
-    # The build can leave nested node_modules trees under
-    # lib/templates/project/<name>/_p_/_m_/_w_/_a_/node_modules — these
-    # come from the webapps dist/ tree being copied verbatim and from
-    # `npm install --package-lock-only` partially materializing on newer
-    # npm. They blow up `vsce package` later (vsce trips on .bin scripts).
-    # Strip any node_modules under the built templates tree.
-    log "Stripping stray node_modules from built templates"
-    stray_count=0
-    while IFS= read -r -d '' nm; do
-      /bin/rm -rf "$nm"
-      stray_count=$((stray_count+1))
-    done < <(find "$TEMPLATES_DIR/lib/templates" "$TEMPLATES_DIR/src/templates" \
-              -type d -name node_modules -prune -print0 2>/dev/null)
-    info "Removed $stray_count stray node_modules tree(s)"
-  fi
-  # Make salesforcedx-templates itself linkable
-  ( cd "$TEMPLATES_DIR" && npm link >/dev/null )
+  # The bumped template packages may contain a node_modules tree under
+  # _p_/_m_/_w_/_a_/ (artifact of how they were published). It's not used
+  # at runtime and trips up downstream consumers — strip it.
+  stray_count=0
+  while IFS= read -r -d '' nm; do
+    /bin/rm -rf "$nm"
+    stray_count=$((stray_count+1))
+  done < <(find "$TEMPLATES_DIR/lib/templates" "$TEMPLATES_DIR/src/templates" \
+            -type d -name node_modules -prune -print0 2>/dev/null)
+  [[ $stray_count -gt 0 ]] && info "Removed $stray_count stray node_modules tree(s)"
 fi
 
 # ── Step 3: salesforcedx-templates → plugin-templates (npm link) ──────────────
@@ -376,11 +337,9 @@ if want_step 3; then
   log "Compiling plugin-templates"
   ( cd "$PLUGIN_TEMPLATES_DIR" && yarn run compile )
 
-  PT_NM="$PLUGIN_TEMPLATES_DIR/node_modules/@salesforce"
-  /bin/rm -rf "$PT_NM/templates"
-  mkdir -p "$PT_NM"
-  ln -s "$TEMPLATES_DIR" "$PT_NM/templates"
-  info "Symlinked @salesforce/templates → $TEMPLATES_DIR"
+  # NOTE: the @salesforce/templates symlink is intentionally created in
+  # step 4 — `sf plugins link` runs its own install and would clobber a
+  # symlink left here.
 fi
 
 # ── Step 4: link plugin-templates into local sf CLI ───────────────────────────
@@ -388,228 +347,26 @@ if want_step 4; then
   step "Step 4: sf plugins link plugin-templates"
   [[ -z "$PLUGIN_TEMPLATES_DIR" ]] && PLUGIN_TEMPLATES_DIR="$WORKDIR/plugin-templates"
   [[ -d "$PLUGIN_TEMPLATES_DIR" ]] || die "plugin-templates not present — run step 3 first"
-  sf plugins link "$PLUGIN_TEMPLATES_DIR"
-fi
-
-# ── Step 5: clone + build salesforcedx-vscode CLEAN (no link yet) ─────────────
-# Linking @salesforce/templates here would pollute the dep tree and break
-# step 6's `npm list --production` check inside vscode:package. We instead
-# patch the *installed* extension after step 6 (see VSCODE_TEMPLATES_PATCH).
-VSCODE_DIR=""
-VSCODE_TEMPLATES_CONSUMERS=()
-VSCODE_TEMPLATES_LINKS=()
-if want_step 5; then
-  step "Step 5: clone + build salesforcedx-vscode, link templates pre-bundle"
-  [[ -z "$TEMPLATES_DIR" ]] && TEMPLATES_DIR="$(clone_into_workdir "$TEMPLATES_REPO")"
-  VSCODE_DIR="$(clone_into_workdir "$VSCODE_REPO")"
-  install_and_build "$VSCODE_DIR"
-
-  # Find consumer dirs and symlink @salesforce/templates into each one's
-  # private node_modules (not the root — that would break vscode:package's
-  # `npm list --production` integrity check).
-  CONSUMER_DIRS=()
-  while IFS= read -r pj; do CONSUMER_DIRS+=("$(dirname "$pj")"); done < <(find_consumers_of "$VSCODE_DIR" "@salesforce/templates")
-  for c in "${CONSUMER_DIRS[@]}"; do
-    info "Linking @salesforce/templates into ${c#$VSCODE_DIR/}/node_modules"
-    mkdir -p "$c/node_modules/@salesforce"
-    /bin/rm -rf "$c/node_modules/@salesforce/templates"
-    ln -s "$TEMPLATES_DIR" "$c/node_modules/@salesforce/templates"
-    VSCODE_TEMPLATES_LINKS+=("$c/node_modules/@salesforce/templates")
-  done
-  [[ ${#CONSUMER_DIRS[@]} -eq 0 ]] && warn "No vscode package consumes @salesforce/templates"
-fi
-
-# ── Step 6: build vsix from salesforcedx-vscode, install, then patch ─────────
-if want_step 6; then
-  step "Step 6: package and install salesforcedx-vscode VSIX(s)"
-  [[ -z "$VSCODE_DIR" ]] && VSCODE_DIR="$WORKDIR/salesforcedx-vscode"
-  [[ -d "$VSCODE_DIR" ]] || die "salesforcedx-vscode not cloned — run step 5 first"
   [[ -z "$TEMPLATES_DIR" ]] && TEMPLATES_DIR="$WORKDIR/salesforcedx-templates"
+  [[ -d "$TEMPLATES_DIR" ]] || die "salesforcedx-templates not present — run step 2 first"
 
-  OUT_DIR="$WORKDIR/_vsix"; mkdir -p "$OUT_DIR"
+  sf plugins link "$PLUGIN_TEMPLATES_DIR"
 
-  # We only need to rebuild the extensions that actually consume
-  # @salesforce/templates — everything else can stay at its registry-
-  # published version. This cuts step 6 from ~5 minutes to ~1.5 minutes.
-  #
-  # CONSUMER_DIRS was populated in step 5. If step 6 was run standalone,
-  # rediscover.
-  CONSUMER_DIRS=("${CONSUMER_DIRS[@]:-}")
-  if [[ ${#CONSUMER_DIRS[@]} -eq 0 || -z "${CONSUMER_DIRS[0]:-}" ]]; then
-    CONSUMER_DIRS=()
-    while IFS= read -r pj; do CONSUMER_DIRS+=("$(dirname "$pj")"); done \
-      < <(find_consumers_of "$VSCODE_DIR" "@salesforce/templates")
-  fi
-  CONSUMER_NAMES=()
-  for c in "${CONSUMER_DIRS[@]}"; do
-    CONSUMER_NAMES+=("$(basename "$c")")
-  done
-  if [[ ${#CONSUMER_NAMES[@]} -eq 0 ]]; then
-    warn "No vscode packages consume @salesforce/templates — skipping step 6"
-    return 0 2>/dev/null || true
-  fi
-  log "Building only @salesforce/templates consumers: ${CONSUMER_NAMES[*]}"
-
-  # The repo provides root scripts that wireit-orchestrate bundle + package
-  # per extension. Use them — running vsce per-package fails because the
-  # bundler step is owned by `vscode:bundle`, not `build`/`compile`.
-  # Use wireit's per-target invocation to limit work to the consumers.
-  log "Running vscode:bundle for consumers only (esbuild)"
-  for n in "${CONSUMER_NAMES[@]}"; do
-    info "bundle: $n"
-    ( cd "$VSCODE_DIR/packages/$n" && npm run vscode:bundle )
-  done
-
-  # Remove the per-package @salesforce/templates symlinks before vscode:package,
-  # otherwise vsce's `npm list --production` rejects them as extraneous. The
-  # bundler has already inlined the code into dist/ at this point.
-  if [[ ${#VSCODE_TEMPLATES_LINKS[@]} -gt 0 ]]; then
-    log "Removing pre-bundle symlinks (code is already inlined into dist/)"
-    for l in "${VSCODE_TEMPLATES_LINKS[@]}"; do
-      [[ -L "$l" ]] && /bin/rm -f "$l" && info "unlinked ${l#$VSCODE_DIR/}"
-    done
-  fi
-
-  # Esbuild copies the templates dir verbatim into each consumer's dist/
-  # (so the runtime can read template files at extension load). The bundled
-  # templates contain inner package.json files (the user-facing scaffolds
-  # for `npm ci` after generation). When `vsce package` runs `npm install`
-  # in its temp build dir, npm 11 walks into those inner package.json files
-  # and creates a node_modules tree with .bin symlinks — which then dangle
-  # and trip vsce with `EEXIST`/`currentLevel undefined`.
-  #
-  # Workaround: before vsce, hide the inner package.json + package-lock.json
-  # files so npm's recursion can't see them. Restore after.
-  # vsce's bundled-extension.ts runs `npm install` in a /tmp staging dir
-  # that contains nested package.json files (the user-facing template
-  # scaffolds). npm 11 walks into those nested files and creates broken
-  # `.bin` symlinks that vsce then chokes on. Patch the script to skip
-  # those nested package.json files via `--workspaces=false`, plus pass
-  # `NPM_CONFIG_PACKAGE_LOCK_ONLY=true` to avoid materializing any tree.
-  log "Patching vsce-bundled-extension.ts to neutralize nested npm walk"
-  BUNDLED_TS="$VSCODE_DIR/scripts/vsce-bundled-extension.ts"
-  if [[ -f "$BUNDLED_TS" && ! -f "$BUNDLED_TS.afv-orig" ]]; then
-    cp "$BUNDLED_TS" "$BUNDLED_TS.afv-orig"
-  fi
-  if [[ -f "$BUNDLED_TS" ]]; then
-    # Insert renames of nested package.json files BEFORE npm install,
-    # restore AFTER vsce package. Idempotent — won't double-patch.
-    if ! grep -q 'AFV_RENAME_NESTED' "$BUNDLED_TS"; then
-      python3 - "$BUNDLED_TS" <<'PY'
-import sys, re, pathlib
-p = pathlib.Path(sys.argv[1])
-src = p.read_text()
-hide_block = """
-// AFV_RENAME_NESTED: hide nested package.json/package-lock.json under dist/templates
-// so the upcoming `npm install` (in this temp build dir) doesn't walk into them
-// and create dangling .bin symlinks that break vsce.
-import { renameSync as _afvRenameSync } from 'fs';
-function _afvWalkRename(dir: string, suffix: string): string[] {
-  const out: string[] = [];
-  const entries = readdirSync(dir, { withFileTypes: true });
-  for (const e of entries) {
-    const full = `${dir}/${e.name}`;
-    if (e.isDirectory()) {
-      out.push(..._afvWalkRename(full, suffix));
-    } else if ((e.name === 'package.json' || e.name === 'package-lock.json')
-               && (full.includes('/dist/templates/') || full.includes('/extension/dist/templates/'))) {
-      _afvRenameSync(full, full + suffix);
-      out.push(full);
-    }
-  }
-  return out;
-}
-const _afvHidden: string[] = [];
-try {
-  if (existsSync(`${cwd}/dist/templates`)) _afvHidden.push(..._afvWalkRename(`${cwd}/dist/templates`, '.afv-hidden'));
-} catch (e) { logger('AFV hide failed: ' + (e as Error).message); }
-logger(`AFV: hidden ${_afvHidden.length} nested package.json files`);
-"""
-restore_block = """
-// AFV_RENAME_NESTED: restore the hidden files INTO the produced .vsix.
-// vsce just packaged the tree without them; we patch the .vsix here so
-// end users get a complete template scaffold.
-for (const f of _afvHidden) {
-  try { _afvRenameSync(f + '.afv-hidden', f); } catch {}
-}
-// Add restored files back into the .vsix using the system `zip` tool.
-const _afvVsix = readdirSync(cwd).find((f) => f.endsWith('.vsix'));
-if (_afvVsix && _afvHidden.length > 0) {
-  const _path = require('path');
-  const _afvVsixAbs = `${cwd}/${_afvVsix}`;
-  for (const f of _afvHidden) {
-    // f is like /tmp/.../extension/dist/templates/.../package.json — add as extension/dist/...
-    const idx = f.indexOf('/extension/');
-    if (idx === -1) continue;
-    const inZip = f.slice(idx + 1);  // strip leading slash via +1
-    const stage = require('os').tmpdir() + '/afv-stage-' + Date.now() + Math.random();
-    require('fs').mkdirSync(`${stage}/${_path.dirname(inZip)}`, { recursive: true });
-    require('fs').copyFileSync(f, `${stage}/${inZip}`);
-    try { execSync(`zip -qr "${_afvVsixAbs}" .`, { cwd: stage, stdio: 'pipe' }); } catch {}
-    try { require('fs').rmSync(stage, { recursive: true, force: true }); } catch {}
-  }
-  logger(`AFV: re-added ${_afvHidden.length} files to ${_afvVsix}`);
-}
-"""
-
-# Insert hide block right BEFORE the npm install line
-src2 = re.sub(
-    r"(\nlogger\('executing npm install'\);)",
-    hide_block + r"\1",
-    src,
-    count=1,
-)
-if src2 == src:
-    print("WARN: hide insertion point not found", file=sys.stderr)
-
-# Insert restore block right AFTER 'copy vsix back to extension directory' logger
-src3 = re.sub(
-    r"(logger\('copy vsix back to extension directory'\);)",
-    restore_block + r"\1",
-    src2,
-    count=1,
-)
-if src3 == src2:
-    print("WARN: restore insertion point not found", file=sys.stderr)
-
-p.write_text(src3)
-print("AFV patch applied")
-PY
-    fi
-  fi
-
-  # Strip any node_modules already present in dist/templates (from prior runs)
-  # so cpSync into the temp build dir doesn't carry dangling .bin symlinks.
-  while IFS= read -r -d '' nm; do
-    /bin/rm -rf "$nm"
-  done < <(find "$VSCODE_DIR/packages" -path '*/dist/templates/*node_modules' -type d -prune -print0 2>/dev/null)
-
-  # Per-package script is `vscode:package:legacy` (the root has `vscode:package`
-  # which fans out to ALL packages — we don't want that).
-  log "Running vscode:package:legacy for consumers only (vsce)"
-  for n in "${CONSUMER_NAMES[@]}"; do
-    info "package: $n"
-    ( cd "$VSCODE_DIR/packages/$n" && npm run vscode:package:legacy ) || warn "vscode:package:legacy failed for $n"
-  done
-
-  # Collect produced VSIX files.
-  packaged=0
-  while IFS= read -r -d '' v; do
-    cp "$v" "$OUT_DIR/"
-    packaged=$((packaged+1))
-  done < <(find "$VSCODE_DIR/packages" -maxdepth 2 -name '*.vsix' -print0)
-
-  for v in "$OUT_DIR"/*.vsix; do
-    [[ -f "$v" ]] || continue
-    log "Installing $(basename "$v")"
-    code --install-extension "$v" --force || warn "install failed: $v"
-  done
-  log "Packaged $packaged extension(s) into $OUT_DIR"
+  # `sf plugins link` re-runs npm/yarn install inside the linked plugin,
+  # which replaces any pre-existing @salesforce/templates symlink with a
+  # real install of the registry version. Symlink AFTER the link so our
+  # local salesforcedx-templates is what actually loads.
+  PT_NM="$PLUGIN_TEMPLATES_DIR/node_modules/@salesforce"
+  /bin/rm -rf "$PT_NM/templates"
+  mkdir -p "$PT_NM"
+  ln -s "$TEMPLATES_DIR" "$PT_NM/templates"
+  info "Symlinked @salesforce/templates → $TEMPLATES_DIR (post-link)"
 fi
 
-# ── Step 7: install skills from sf-skills-internal PR #157 ────────────────────
-if want_step 7; then
-  step "Step 7: install skills from $SKILLS_PR_REPO PR #$SKILLS_PR_NUMBER"
+
+# ── Step 5: install skills from sf-skills-internal PR #157 ────────────────────
+if want_step 5; then
+  step "Step 5: install skills from $SKILLS_PR_REPO PR #$SKILLS_PR_NUMBER"
   ensure_gh_account_for "$(owner_of "$SKILLS_PR_REPO")"
   SKILLS_DIR_SRC="$WORKDIR/sf-skills-internal"
   if [[ ! -d "$SKILLS_DIR_SRC/.git" ]]; then
@@ -641,14 +398,14 @@ if want_step 7; then
   log "Installed $copied skill(s) into $TARGET"
 fi
 
-# ── Step 8: override AFV sample-app source with PR #289 ──────────────────────
+# ── Step 6: override AFV sample-app source with PR #289 ──────────────────────
 # The Einstein-GPT extension clones afv-library at runtime to fetch sample
 # apps. We seed a local bare repo with afv-library + PR #289's updated
 # samples spliced in, then add a global git url.insteadOf rewrite so the
 # extension's `git clone https://github.com/forcedotcom/afv-library` resolves
 # to that local repo. Idempotent and reversible.
-if want_step 8; then
-  step "Step 8: override sample apps from $SAMPLE_APPS_PR_REPO PR #$SAMPLE_APPS_PR_NUMBER"
+if want_step 6; then
+  step "Step 6: override sample apps from $SAMPLE_APPS_PR_REPO PR #$SAMPLE_APPS_PR_NUMBER"
   ensure_gh_account_for "$(owner_of "$SAMPLE_APPS_PR_REPO")"
 
   # 1. Clone the upstream afv-library that the extension references.

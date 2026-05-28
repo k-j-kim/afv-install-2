@@ -82,7 +82,7 @@ fi
 
 # ── gh access to required repos (one probe per owner) ────────────────────────
 if command -v gh >/dev/null && gh auth status >/dev/null 2>&1; then
-  declare -a OWNERS=( "forcedotcom" "salesforcecli" "salesforce-experience-platform-emu" "salesforce-internal" )
+  declare -a OWNERS=( "forcedotcom" "salesforcecli" "salesforce-internal" )
   active="$(gh auth status 2>&1 | awk '/Logged in to github.com account/{last=$NF; for(i=1;i<=NF;i++) if($i=="account") last=$(i+1)} /Active account: true/{print last; exit}')"
   for owner in "${OWNERS[@]}"; do
     found=false

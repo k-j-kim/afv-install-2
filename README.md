@@ -41,7 +41,15 @@ The internal Salesforce repos (`salesforce-experience-platform-emu`,
 auto-pick whichever logged-in account has access — no config edits needed.
 If you're missing access, those steps surface as preflight warnings.
 
-## Uninstall
+## Uninstall (one-liner)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/k-j-kim/afv-install-2/main/uninstall-curl.sh | bash
+# or non-interactive:
+curl -fsSL https://raw.githubusercontent.com/k-j-kim/afv-install-2/main/uninstall-curl.sh | bash -s -- -y
+```
+
+Or from a local clone:
 
 ```bash
 bash uninstall.sh           # interactive — confirms each section
