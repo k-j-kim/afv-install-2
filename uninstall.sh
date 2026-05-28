@@ -81,27 +81,50 @@ if want plugin; then
   fi
 fi
 
-# ── 3. Remove installed AFV skills from Einstein-GPT globalStorage ───────────
+# ── 3. Remove installed AFV skills + clear globalSkillsToggles ───────────────
 if want skills; then
-  step "Section 3: remove installed AFV skills"
+  step "Section 3: remove installed AFV skills + clear toggles"
   case "$(uname -s)" in
-    Darwin) SKILLS_DIR="$HOME/Library/Application Support/Code/User/globalStorage/salesforce.salesforcedx-einstein-gpt/Skills-Salesforce" ;;
-    Linux)  SKILLS_DIR="$HOME/.config/Code/User/globalStorage/salesforce.salesforcedx-einstein-gpt/Skills-Salesforce" ;;
-    *) warn "Unsupported OS — skipping"; SKILLS_DIR="" ;;
+    Darwin) EINSTEIN_DIR="$HOME/Library/Application Support/Code/User/globalStorage/salesforce.salesforcedx-einstein-gpt"
+            VSCDB="$HOME/Library/Application Support/Code/User/globalStorage/state.vscdb" ;;
+    Linux)  EINSTEIN_DIR="$HOME/.config/Code/User/globalStorage/salesforce.salesforcedx-einstein-gpt"
+            VSCDB="$HOME/.config/Code/User/globalStorage/state.vscdb" ;;
+    *) warn "Unsupported OS — skipping"; EINSTEIN_DIR="" ;;
   esac
-  if [[ -n "$SKILLS_DIR" && -d "$SKILLS_DIR" ]]; then
-    count=$(find "$SKILLS_DIR" -mindepth 1 -maxdepth 1 -type d | wc -l | tr -d ' ')
-    if (( count > 0 )); then
-      info "Found $count skill(s) in $SKILLS_DIR"
-      if confirm "Delete all $count skill(s)?"; then
-        find "$SKILLS_DIR" -mindepth 1 -maxdepth 1 -type d -exec /bin/rm -rf {} +
-        log "Removed $count skill(s)"
+  if [[ -n "$EINSTEIN_DIR" ]]; then
+    SKILLS_DIR="$EINSTEIN_DIR/Skills"
+    if [[ -d "$SKILLS_DIR" ]]; then
+      count=$(find "$SKILLS_DIR" -mindepth 1 -maxdepth 1 -type d | wc -l | tr -d ' ')
+      if (( count > 0 )); then
+        info "Found $count skill(s) in $SKILLS_DIR"
+        if confirm "Delete all $count skill(s) from Skills/ ?"; then
+          find "$SKILLS_DIR" -mindepth 1 -maxdepth 1 -type d -exec /bin/rm -rf {} +
+          log "Removed $count skill(s) from Skills/"
+        fi
       fi
-    else
-      info "No skills installed."
     fi
-  else
-    info "Skills dir does not exist: $SKILLS_DIR"
+    # Clear globalSkillsToggles entries that point at Skills-Salesforce/
+    # so previously-disabled official skills come back.
+    if [[ -f "$VSCDB" ]] && command -v sqlite3 >/dev/null && command -v python3 >/dev/null; then
+      if confirm "Clear globalSkillsToggles entries (re-enables Salesforce skills we disabled)?"; then
+        python3 - "$VSCDB" <<'PY'
+import sys, json, sqlite3
+con = sqlite3.connect(sys.argv[1]); cur = con.cursor()
+KEY = 'salesforce.salesforcedx-einstein-gpt'
+row = cur.execute("SELECT value FROM ItemTable WHERE key=?", (KEY,)).fetchone()
+if not row:
+  print("ext state row not found"); sys.exit(0)
+state = json.loads(row[0])
+toggles = state.get('globalSkillsToggles') or {}
+removed = [k for k,v in toggles.items() if v is False and 'Skills-Salesforce/' in k]
+for k in removed: del toggles[k]
+state['globalSkillsToggles'] = toggles
+cur.execute("UPDATE ItemTable SET value=? WHERE key=?", (json.dumps(state), KEY))
+con.commit(); con.close()
+print(f"  cleared {len(removed)} toggle(s)")
+PY
+      fi
+    fi
   fi
 fi
 

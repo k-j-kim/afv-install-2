@@ -376,26 +376,77 @@ if want_step 5; then
   fi
 
   case "$(uname -s)" in
-    Darwin) EINSTEIN_DIR="$HOME/Library/Application Support/Code/User/globalStorage/salesforce.salesforcedx-einstein-gpt" ;;
-    Linux)  EINSTEIN_DIR="$HOME/.config/Code/User/globalStorage/salesforce.salesforcedx-einstein-gpt" ;;
+    Darwin) EINSTEIN_DIR="$HOME/Library/Application Support/Code/User/globalStorage/salesforce.salesforcedx-einstein-gpt"
+            VSCDB="$HOME/Library/Application Support/Code/User/globalStorage/state.vscdb" ;;
+    Linux)  EINSTEIN_DIR="$HOME/.config/Code/User/globalStorage/salesforce.salesforcedx-einstein-gpt"
+            VSCDB="$HOME/.config/Code/User/globalStorage/state.vscdb" ;;
     *) die "Unsupported OS" ;;
   esac
-  TARGET="$EINSTEIN_DIR/Skills-Salesforce"
+
+  # Install into Skills/ (user-global), NOT Skills-Salesforce/ (auto-managed).
+  # The Einstein-GPT extension auto-prunes Skills-Salesforce/ to match its
+  # baked-in afvSystemSkillsVersion registry, so anything we drop there gets
+  # silently removed on resync. Skills/ is the user space — never pruned.
+  TARGET="$EINSTEIN_DIR/Skills"
+  OFFICIAL="$EINSTEIN_DIR/Skills-Salesforce"
   mkdir -p "$TARGET"
 
   SRC="$SKILLS_DIR_SRC/$SKILLS_SUBDIR"
   [[ -d "$SRC" ]] || die "Expected $SRC in PR checkout"
 
-  # Only touch directories that are present in this PR — don't blow away the world.
   copied=0
+  CONFLICTING_PATHS=()
   while IFS= read -r -d '' d; do
     name="$(basename "$d")"
-    rm -rf "$TARGET/$name"
+    /bin/rm -rf "$TARGET/$name"
     cp -r "$d" "$TARGET/$name"
-    info "Installed skill: $name"
+    info "Installed skill: $name (global)"
     copied=$((copied+1))
+
+    # Track any same-named skill that lives in the official dir — we'll
+    # disable its toggle below so it doesn't run alongside our version.
+    [[ -d "$OFFICIAL/$name" ]] && CONFLICTING_PATHS+=("$OFFICIAL/$name")
   done < <(find "$SRC" -mindepth 1 -maxdepth 1 -type d -print0)
-  log "Installed $copied skill(s) into $TARGET"
+  log "Installed $copied skill(s) into $TARGET (global, persists across resyncs)"
+
+  # Disable any duplicates in Skills-Salesforce/ via globalSkillsToggles.
+  # The extension stores per-skill enabled/disabled state in state.vscdb under
+  # the key 'salesforce.salesforcedx-einstein-gpt' → 'globalSkillsToggles'
+  # ({absolute_path: true|false}). We set false for each conflicting path.
+  if [[ ${#CONFLICTING_PATHS[@]} -gt 0 && -f "$VSCDB" ]]; then
+    log "Disabling ${#CONFLICTING_PATHS[@]} duplicate skill(s) in Skills-Salesforce/"
+    if ! command -v sqlite3 >/dev/null; then
+      warn "sqlite3 not found — cannot toggle duplicates. Install sqlite3 or do it via VS Code UI."
+    else
+      python3 - "$VSCDB" "${CONFLICTING_PATHS[@]}" <<'PY'
+import sys, json, sqlite3
+db = sys.argv[1]
+paths = sys.argv[2:]
+con = sqlite3.connect(db)
+cur = con.cursor()
+KEY = 'salesforce.salesforcedx-einstein-gpt'
+row = cur.execute("SELECT value FROM ItemTable WHERE key=?", (KEY,)).fetchone()
+if not row:
+  print("ext state row not found — skipping")
+  sys.exit(0)
+state = json.loads(row[0])
+toggles = state.get('globalSkillsToggles') or {}
+changed = 0
+for p in paths:
+  if toggles.get(p) is not False:
+    toggles[p] = False
+    changed += 1
+state['globalSkillsToggles'] = toggles
+cur.execute("UPDATE ItemTable SET value=? WHERE key=?", (json.dumps(state), KEY))
+con.commit()
+con.close()
+print(f"  toggled {changed} skill(s) → disabled")
+for p in paths:
+  print(f"    · {p}")
+PY
+    fi
+    warn "Reload the VS Code window to pick up the toggle changes"
+  fi
 fi
 
 # ── Step 6: override AFV sample-app source with PR #289 ──────────────────────
