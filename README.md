@@ -4,21 +4,49 @@ One script that wires up local sf CLI + VS Code to consume in-flight changes
 across the AFV / templates / sf-cli stack via `npm link`, then drops the
 latest skills from a PR into Einstein-GPT.
 
-## Quick start
+## Quick start (one-liner)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/k-j-kim/afv-install-2/main/install.sh | bash -s -- --keep
+```
+
+This clones the repo into `~/.afv-install-2`, runs preflight checks, then
+runs all 8 install steps. Pass any flags through `bash -s --` (e.g.
+`--skip 6` to skip the slow VS Code VSIX rebuild).
+
+## Or clone and run manually
 
 ```bash
 git clone https://github.com/k-j-kim/afv-install-2.git
 cd afv-install-2
-bash sfdx-local-test-install.sh --keep
+bash preflight.sh                       # check prerequisites
+bash sfdx-local-test-install.sh --keep  # actual install
 ```
 
-You need `gh` logged in for both your public and internal Salesforce GitHub
-accounts (the script auto-switches via `gh auth switch` per repo owner).
-Edit `GH_ACCOUNT_PUBLIC` / `GH_ACCOUNT_INTERNAL` in `repos.conf` if your
-account names differ from `k-j-kim` / `kj-kim_sfemu`.
+## Preflight
 
-You also need the local AFV `.vsix` at the path in `LOCAL_VSIX` (in
-`repos.conf`) — update that path for your machine.
+`preflight.sh` checks for required tools (gh, git, node>=22, npm, sf, code,
+python3, zip), confirms `gh` is logged in with access to each repo owner the
+script will clone (forcedotcom, salesforcecli, salesforce-experience-platform-emu,
+salesforce-internal), and verifies disk space. Run it standalone any time:
+
+```bash
+bash preflight.sh           # full output
+bash preflight.sh --quiet   # only print failures
+bash preflight.sh --json    # machine-readable
+```
+
+The internal Salesforce repos (`salesforce-experience-platform-emu`,
+`salesforce-internal`) need a `gh` account with org access. The script will
+auto-pick whichever logged-in account has access — no config edits needed.
+If you're missing access, those steps surface as preflight warnings.
+
+## Uninstall
+
+```bash
+bash uninstall.sh           # interactive — confirms each section
+bash uninstall.sh -y        # non-interactive
+```
 
 ## Steps
 
