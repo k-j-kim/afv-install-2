@@ -151,7 +151,29 @@ fi
 for pkg_dir in "${CONSUMERS[@]}"; do
   name="$(basename "$pkg_dir")"
   log "Packaging $name (vsce)"
-  ( cd "$pkg_dir" && npm run vscode:package:legacy ) || warn "vsce failed for $name"
+  # Each package may use a different package script. Some packages
+  # (e.g. salesforcedx-vscode-services) call `vsce package` directly;
+  # if a @salesforce/templates symlink is present, vsce's `npm list
+  # --production` integrity check will fail with "extraneous". The
+  # bundle has already inlined the templates code into dist/, so we
+  # can safely move the symlink aside, run vsce, then restore.
+  link="$pkg_dir/node_modules/@salesforce/templates"
+  link_target=""
+  if [[ -L "$link" ]]; then
+    link_target="$(readlink "$link")"
+    /bin/rm -f "$link"
+  fi
+
+  if node -e "process.exit(require('$pkg_dir/package.json').scripts?.['vscode:package:legacy'] ? 0 : 1)" 2>/dev/null; then
+    ( cd "$pkg_dir" && npm run vscode:package:legacy ) || warn "vsce failed for $name"
+  elif node -e "process.exit(require('$pkg_dir/package.json').scripts?.['vscode:package'] ? 0 : 1)" 2>/dev/null; then
+    ( cd "$pkg_dir" && npm run vscode:package ) || warn "vsce failed for $name"
+  else
+    ( cd "$pkg_dir" && npx vsce package --allow-package-all-secrets ) || warn "vsce failed for $name"
+  fi
+
+  # Restore symlink for any future re-runs.
+  [[ -n "$link_target" ]] && ln -s "$link_target" "$link"
 done
 
 # Copy produced .vsix into vsix/.
