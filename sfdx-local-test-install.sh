@@ -395,7 +395,7 @@ if want_step 5; then
   [[ -d "$SRC" ]] || die "Expected $SRC in PR checkout"
 
   copied=0
-  CONFLICTING_PATHS=()
+  CONFLICTING_NAMES=()
   while IFS= read -r -d '' d; do
     name="$(basename "$d")"
     /bin/rm -rf "$TARGET/$name"
@@ -403,49 +403,23 @@ if want_step 5; then
     info "Installed skill: $name (global)"
     copied=$((copied+1))
 
-    # Track any same-named skill that lives in the official dir — we'll
-    # disable its toggle below so it doesn't run alongside our version.
-    [[ -d "$OFFICIAL/$name" ]] && CONFLICTING_PATHS+=("$OFFICIAL/$name")
+    # If a same-named skill exists in the auto-managed Skills-Salesforce/,
+    # delete it. The extension's seed logic shadows user skills with the
+    # bundled "system" version, so the only reliable way to make the user
+    # version win is to remove the system one from disk. The seed only
+    # re-copies on version bump (compares Skills-Salesforce/version.json
+    # to the bundled registry version), so this stays sticky across reloads.
+    [[ -d "$OFFICIAL/$name" ]] && CONFLICTING_NAMES+=("$name")
   done < <(find "$SRC" -mindepth 1 -maxdepth 1 -type d -print0)
   log "Installed $copied skill(s) into $TARGET (global, persists across resyncs)"
 
-  # Disable any duplicates in Skills-Salesforce/ via globalSkillsToggles.
-  # The extension stores per-skill enabled/disabled state in state.vscdb under
-  # the key 'salesforce.salesforcedx-einstein-gpt' → 'globalSkillsToggles'
-  # ({absolute_path: true|false}). We set false for each conflicting path.
-  if [[ ${#CONFLICTING_PATHS[@]} -gt 0 && -f "$VSCDB" ]]; then
-    log "Disabling ${#CONFLICTING_PATHS[@]} duplicate skill(s) in Skills-Salesforce/"
-    if ! command -v sqlite3 >/dev/null; then
-      warn "sqlite3 not found — cannot toggle duplicates. Install sqlite3 or do it via VS Code UI."
-    else
-      python3 - "$VSCDB" "${CONFLICTING_PATHS[@]}" <<'PY'
-import sys, json, sqlite3
-db = sys.argv[1]
-paths = sys.argv[2:]
-con = sqlite3.connect(db)
-cur = con.cursor()
-KEY = 'salesforce.salesforcedx-einstein-gpt'
-row = cur.execute("SELECT value FROM ItemTable WHERE key=?", (KEY,)).fetchone()
-if not row:
-  print("ext state row not found — skipping")
-  sys.exit(0)
-state = json.loads(row[0])
-toggles = state.get('globalSkillsToggles') or {}
-changed = 0
-for p in paths:
-  if toggles.get(p) is not False:
-    toggles[p] = False
-    changed += 1
-state['globalSkillsToggles'] = toggles
-cur.execute("UPDATE ItemTable SET value=? WHERE key=?", (json.dumps(state), KEY))
-con.commit()
-con.close()
-print(f"  toggled {changed} skill(s) → disabled")
-for p in paths:
-  print(f"    · {p}")
-PY
-    fi
-    warn "Reload the VS Code window to pick up the toggle changes"
+  if [[ ${#CONFLICTING_NAMES[@]} -gt 0 ]]; then
+    log "Removing ${#CONFLICTING_NAMES[@]} same-named skill(s) from Skills-Salesforce/ to unshadow user copies"
+    for name in "${CONFLICTING_NAMES[@]}"; do
+      /bin/rm -rf "$OFFICIAL/$name"
+      info "removed: Skills-Salesforce/$name"
+    done
+    info "Skills-Salesforce/version.json kept as-is — extension won't re-seed unless its bundled version bumps"
   fi
 fi
 

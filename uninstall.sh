@@ -103,26 +103,15 @@ if want skills; then
         fi
       fi
     fi
-    # Clear globalSkillsToggles entries that point at Skills-Salesforce/
-    # so previously-disabled official skills come back.
-    if [[ -f "$VSCDB" ]] && command -v sqlite3 >/dev/null && command -v python3 >/dev/null; then
-      if confirm "Clear globalSkillsToggles entries (re-enables Salesforce skills we disabled)?"; then
-        python3 - "$VSCDB" <<'PY'
-import sys, json, sqlite3
-con = sqlite3.connect(sys.argv[1]); cur = con.cursor()
-KEY = 'salesforce.salesforcedx-einstein-gpt'
-row = cur.execute("SELECT value FROM ItemTable WHERE key=?", (KEY,)).fetchone()
-if not row:
-  print("ext state row not found"); sys.exit(0)
-state = json.loads(row[0])
-toggles = state.get('globalSkillsToggles') or {}
-removed = [k for k,v in toggles.items() if v is False and 'Skills-Salesforce/' in k]
-for k in removed: del toggles[k]
-state['globalSkillsToggles'] = toggles
-cur.execute("UPDATE ItemTable SET value=? WHERE key=?", (json.dumps(state), KEY))
-con.commit(); con.close()
-print(f"  cleared {len(removed)} toggle(s)")
-PY
+    # Force the extension to re-seed Skills-Salesforce/ on next launch by
+    # bumping (well, deleting) version.json so the seed thinks the disk is
+    # stale. This re-copies the bundled skills back, undoing the deletes
+    # the install script did.
+    SF_DIR="$EINSTEIN_DIR/Skills-Salesforce"
+    if [[ -d "$SF_DIR" ]]; then
+      if confirm "Force AFV to re-seed Skills-Salesforce/ on next launch (restores official skills)?"; then
+        /bin/rm -f "$SF_DIR/version.json"
+        log "Removed $SF_DIR/version.json — extension will re-copy bundled skills on next reload"
       fi
     fi
   fi
