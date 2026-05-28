@@ -434,7 +434,9 @@ if want_step 6; then
   #
   # CONSUMER_DIRS was populated in step 5. If step 6 was run standalone,
   # rediscover.
-  if [[ ${#CONSUMER_DIRS[@]} -eq 0 ]]; then
+  CONSUMER_DIRS=("${CONSUMER_DIRS[@]:-}")
+  if [[ ${#CONSUMER_DIRS[@]} -eq 0 || -z "${CONSUMER_DIRS[0]:-}" ]]; then
+    CONSUMER_DIRS=()
     while IFS= read -r pj; do CONSUMER_DIRS+=("$(dirname "$pj")"); done \
       < <(find_consumers_of "$VSCODE_DIR" "@salesforce/templates")
   fi
@@ -582,10 +584,12 @@ PY
     /bin/rm -rf "$nm"
   done < <(find "$VSCODE_DIR/packages" -path '*/dist/templates/*node_modules' -type d -prune -print0 2>/dev/null)
 
-  log "Running vscode:package for consumers only (vsce)"
+  # Per-package script is `vscode:package:legacy` (the root has `vscode:package`
+  # which fans out to ALL packages — we don't want that).
+  log "Running vscode:package:legacy for consumers only (vsce)"
   for n in "${CONSUMER_NAMES[@]}"; do
     info "package: $n"
-    ( cd "$VSCODE_DIR/packages/$n" && npm run vscode:package ) || warn "vscode:package failed for $n"
+    ( cd "$VSCODE_DIR/packages/$n" && npm run vscode:package:legacy ) || warn "vscode:package:legacy failed for $n"
   done
 
   # Collect produced VSIX files.
