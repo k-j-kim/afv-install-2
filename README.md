@@ -1,8 +1,24 @@
-# sfdx-local-test-install
+# afv-install-2
 
 One script that wires up local sf CLI + VS Code to consume in-flight changes
 across the AFV / templates / sf-cli stack via `npm link`, then drops the
 latest skills from a PR into Einstein-GPT.
+
+## Quick start
+
+```bash
+git clone https://github.com/k-j-kim/afv-install-2.git
+cd afv-install-2
+bash sfdx-local-test-install.sh --keep
+```
+
+You need `gh` logged in for both your public and internal Salesforce GitHub
+accounts (the script auto-switches via `gh auth switch` per repo owner).
+Edit `GH_ACCOUNT_PUBLIC` / `GH_ACCOUNT_INTERNAL` in `repos.conf` if your
+account names differ from `k-j-kim` / `kj-kim_sfemu`.
+
+You also need the local AFV `.vsix` at the path in `LOCAL_VSIX` (in
+`repos.conf`) — update that path for your machine.
 
 ## Steps
 
