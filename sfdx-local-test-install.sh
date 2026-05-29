@@ -79,8 +79,11 @@ for c in gh git node npm sf code; do command -v "$c" >/dev/null || die "Missing:
 command -v jq >/dev/null || warn "jq not found — will fall back to node for JSON edits"
 
 # ── Workdir ───────────────────────────────────────────────────────────────────
+# Default to a persistent location under $HOME, NOT /tmp. The git
+# url.insteadOf rewrite installed by step 6 references this directory
+# at runtime, so if /tmp gets cleaned, AFV's sample-app clones break.
 if [[ -z "$WORKDIR" ]]; then
-  WORKDIR="$(mktemp -d -t sfdx-local-test-XXXXXX)"
+  WORKDIR="$HOME/.afv-install-2-workdir"
 fi
 mkdir -p "$WORKDIR"
 log "Workdir: $WORKDIR"
@@ -373,6 +376,9 @@ if want_step 5; then
     log "Cloning $SKILLS_PR_REPO base + checking out PR #$SKILLS_PR_NUMBER (cross-repo safe)"
     gh repo clone "$SKILLS_PR_REPO" "$SKILLS_DIR_SRC" -- --depth 50 >/dev/null
     ( cd "$SKILLS_DIR_SRC" && gh pr checkout "$SKILLS_PR_NUMBER" )
+  else
+    log "Refreshing skills PR #$SKILLS_PR_NUMBER to latest head"
+    ( cd "$SKILLS_DIR_SRC" && gh pr checkout "$SKILLS_PR_NUMBER" --force ) || warn "PR refresh failed — using existing checkout"
   fi
 
   case "$(uname -s)" in
@@ -433,21 +439,28 @@ if want_step 6; then
   step "Step 6: override sample apps from $SAMPLE_APPS_PR_REPO PR #$SAMPLE_APPS_PR_NUMBER"
   ensure_gh_account_for "$(owner_of "$SAMPLE_APPS_PR_REPO")"
 
-  # 1. Clone the upstream afv-library that the extension references.
+  # 1. Clone (or refresh) the upstream afv-library that the extension references.
   AFV_DIR="$WORKDIR/afv-library"
+  ensure_gh_account_for "forcedotcom"
   if [[ ! -d "$AFV_DIR/.git" ]]; then
     log "Cloning forcedotcom/afv-library (sample source)"
-    ensure_gh_account_for "forcedotcom"
     gh repo clone "forcedotcom/afv-library" "$AFV_DIR" -- --depth 1 >/dev/null
+  else
+    log "Refreshing afv-library to latest"
+    git -C "$AFV_DIR" fetch --depth 1 origin HEAD --quiet \
+      && git -C "$AFV_DIR" reset --hard FETCH_HEAD --quiet || warn "afv-library fetch failed — using existing checkout"
   fi
 
-  # 2. Clone the PR fork and check out the PR head.
+  # 2. Clone (or refresh) the PR fork and check out the latest PR head.
   ensure_gh_account_for "$(owner_of "$SAMPLE_APPS_PR_REPO")"
   PR_DIR="$WORKDIR/sample-apps-pr"
   if [[ ! -d "$PR_DIR/.git" ]]; then
     log "Cloning $SAMPLE_APPS_PR_REPO + checking out PR #$SAMPLE_APPS_PR_NUMBER"
     gh repo clone "$SAMPLE_APPS_PR_REPO" "$PR_DIR" -- --depth 50 >/dev/null
     ( cd "$PR_DIR" && gh pr checkout "$SAMPLE_APPS_PR_NUMBER" )
+  else
+    log "Refreshing PR #$SAMPLE_APPS_PR_NUMBER to latest head"
+    ( cd "$PR_DIR" && gh pr checkout "$SAMPLE_APPS_PR_NUMBER" --force ) || warn "PR refresh failed — using existing checkout"
   fi
 
   # 3. Splice each sample dir from the PR into the afv-library checkout.
